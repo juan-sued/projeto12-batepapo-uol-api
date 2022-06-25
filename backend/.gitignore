@@ -1,3 +1,4 @@
-/node_modules
+node_modules
 /../.vscode
 /../front-bate-papo-uol-main_v2
+.env
