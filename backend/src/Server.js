@@ -1,10 +1,10 @@
 import dotenv from 'dotenv';
-import express, { response } from 'express';
+import express from 'express';
 import chalk from 'chalk';
 import cors from 'cors';
 import { MongoClient } from 'mongodb';
 import joi from 'joi';
-
+import dayjs from 'dayjs';
 //problema na parte de validação
 // ta dando erro na hora de registrar participante
 
@@ -20,6 +20,8 @@ const server = express();
 server.use(cors());
 server.use(express.json());
 
+setInterval(deleteInactives, 15000);
+//participants
 server.post('/participants', async (request, response) => {
   const participant = request.body;
 
@@ -38,14 +40,19 @@ server.post('/participants', async (request, response) => {
   try {
     connectClient();
 
-    userValidation(participant, response);
+    const isRegistered = await db.collection('participants').findOne(participant);
+
+    if (isRegistered) {
+      response.status(409).send('Usuário ja cadastrado');
+      closeClient();
+      return;
+    }
 
     //refatorar
     await db.collection('participants').insertOne({
       name: participant.name,
       lastStatus: Date.now()
     });
-    response.sendStatus(201);
 
     //refatorar
     await db.collection('messages').insertOne({
@@ -53,8 +60,9 @@ server.post('/participants', async (request, response) => {
       to: 'Todos',
       text: 'entra na sala...',
       type: 'status',
-      time: `${Date.getHours()}:${Date.getMinutes()}:${Date.getSeconds()}`
+      time: dayjs().format('HH:mm:ss')
     });
+    response.sendStatus(201);
 
     closeClient();
   } catch {
@@ -78,55 +86,79 @@ server.get('/participants', async (request, response) => {
   }
 });
 
+//messages
 server.post('/messages', async (request, response) => {
   const message = request.body;
-  const messageUser = request.headers.User;
 
-  const isFromValid = db.collection('participants').findOne(messageUser);
-
-  const messageSchema = joi.object({
-    to: joi.string().required(),
-    text: joi.string().required(),
-    type: joi.string().valid('message').valid('private_message'),
-    from: joi.string().valid(isFromValid.name)
-  });
-  const validate = messageSchema.validate(message, { abortEarly: true });
-  const { error } = validate;
-
-  if (error) {
-    const messagesError = error.details.map(error => error.message);
-    response.status(422).send(messagesError);
-    return;
-  }
+  const messageUser = request.headers;
 
   try {
     connectClient();
-    await db.collection('messages').insertOne({
-      to: message.to,
-      text: message.text,
-      type: message.type,
-      from: messageUser,
-      time: `${Date.getHours()}:${Date.getMinutes()}:${Date.getSeconds()}`
+
+    const isFromValid = await db
+      .collection('participants')
+      .findOne({ name: messageUser.user });
+
+    const messageSchema = joi.object({
+      to: joi.string().required(),
+      text: joi.string().required(),
+      type: joi.string().valid('message').valid('private_message'),
+      from: joi.string().valid(isFromValid.name)
     });
-    response.sendStatus(201);
-    closeClient();
+
+    const validate = messageSchema.validate(message, { abortEarly: true });
+    const { error } = validate;
+
+    if (error) {
+      const messagesError = error.details.map(error => error.message);
+      response.status(422).send(messagesError);
+      return;
+    }
+    try {
+      connectClient();
+      await db.collection('messages').insertOne({
+        to: message.to,
+        text: message.text,
+        type: message.type,
+        from: messageUser.user,
+        time: dayjs().format('HH:mm:ss')
+      });
+      response.sendStatus(201);
+      closeClient();
+    } catch {
+      response.send('Não foi possível enviar a mensagem.');
+      closeClient();
+    }
   } catch {
-    response.status().send('Não foi possível enviar a mensagem.');
-    closeClient();
+    response.statusCode(500);
   }
 });
 
 server.get('/messages', async (request, response) => {
   const limit = parseInt(request.query.limit);
+  const messageUser = request.headers;
 
   try {
     connectClient();
-    const messagesList = await db.collection('messages').find().toArray();
 
-    if (!limit) response.send(messagesList);
+    const userMessages = await db
+      .collection('messages')
+      .find({
+        $or: [
+          { from: messageUser.user },
+          { to: messageUser.user },
+          { to: 'Todos' },
+          { type: 'message' }
+        ]
+      })
+      .toArray();
 
-    const lastMessages = messagesList.reverse().filter((message, index) => index < limit);
-    console.log(lastMessages);
+    if (!limit) {
+      response.send(userMessages);
+      return;
+    }
+
+    const lastMessages = userMessages.slice(-limit);
     response.send(lastMessages);
 
     closeClient();
@@ -138,23 +170,88 @@ server.get('/messages', async (request, response) => {
   }
 });
 
-server.listen(5500, () => {
-  console.log(chalk.cyan('Rodando na porta 5500'));
+//status
+server.post('/status', async (request, response) => {
+  const message = request.body;
+  const messageUser = request.headers;
+
+  try {
+    connectClient();
+    const participants = await db.collection('participants');
+    const participant = await db
+      .collection('participants')
+      .findOne({ name: messageUser.user });
+
+    if (!participant) {
+      response.sendStatus(404);
+      closeClient();
+      return;
+    }
+
+    await participants.updateOne(
+      { name: participant.name },
+      { $set: { lastStatus: Date.now() } }
+    );
+
+    response.sendStatus(200);
+    closeClient();
+  } catch {
+    response.send('Não foi possível enviar a mensagem.');
+    closeClient();
+  }
+});
+
+async function deleteInactives() {
+  let usersInactiveList = [];
+  const timeUserInactive = Date.now() - 10000;
+
+  try {
+    connectClient();
+
+    const partipantsInactives = await db
+      .collection('participants')
+      .findOne({ lastStatus: { $lt: timeUserInactive } });
+
+    usersInactiveList.push(partipantsInactives.name);
+
+    if (!usersInactiveList) return;
+
+    for (let i = 0; i < usersInactiveList.length; i++) {
+      await db.collection('participants').deleteOne({ name: usersInactiveList[i] });
+
+      await db.collection('messages').insertOne({
+        from: usersInactiveList[i],
+        to: 'Todos',
+        text: 'sai da sala...',
+        type: 'status',
+        time: dayjs().format('HH:mm:ss')
+      });
+    }
+    usersInactiveList = [];
+
+    closeClient();
+  } catch {
+    response.statusCode(500);
+    closeClient();
+  }
+}
+
+server.listen(5000, () => {
+  console.log(chalk.cyan('Rodando na porta 5000'));
 });
 
 async function connectClient() {
-  await client.connect();
+  try {
+    await client.connect();
+  } catch {
+    console.log('deu ruim no connect');
+  }
 }
 
 function closeClient() {
-  client.close();
-}
-
-async function userValidation(participant, response) {
-  const isRegistered = await db.collection('participants').findOne(participant);
-  if (isRegistered) {
-    response.status(409).send('Usuário ja cadastrado');
-    closeClient();
-    return;
+  try {
+    client.close();
+  } catch {
+    console.log('deu ruim no close');
   }
 }
